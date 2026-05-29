@@ -37,7 +37,9 @@ create table Images(
     user_id int,
     file_path TEXT, -- azure blob storage
     upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    status ENUM('pending', 'processed', 'error')
+    status ENUM('pending', 'processed', 'error'),
+    longitude decimal(9,6) DEFAULT NULL,
+    latitude decimal(8,6) DEFAULT NULL
 );
 
 create table DetectionResults(
@@ -53,12 +55,13 @@ create table DetectionResults(
 create table Outbreak(
     outbreak_id INT PRIMARY KEY AUTO_INCREMENT,
     disease_id INT NOT NULL, -- fk diseases diseaseid
-    longitude DECIMAL(9,6) NOT NULL, 
+    longitude DECIMAL(9,6) NOT NULL,
     latitude DECIMAL(8,6) NOT NULL, 
     radius DECIMAL(5,5) NOT NULL, -- unknown, need to look into to find a good data type
     amount INT, -- will be dynamically changed based on detections and server
-    startdate TIMESTAMP, -- start of outbreak detection results
-    enddate TIMESTAMP -- if it is determined to end or -1 for ongoing/indefinite
+    start_date DATE DEFAULT (CURRENT_DATE), -- start of outbreak detection results
+    end_date DATE DEFAULT ((CURRENT_DATE + INTERVAL 1 YEAR)), -- if it is determined to end or -1 for ongoing/indefinite
+    last_update_date DATE DEFAULT (current_date)
 );
 
 create table Diseases(
