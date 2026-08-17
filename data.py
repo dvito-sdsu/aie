@@ -5,6 +5,9 @@ from pathlib import Path
 from PIL import Image
 import os
 import random
+from skimage import measure
+from shapely.geometry import Polygon, MultiPoint
+import matplotlib.pyplot as plt
 
 
 def genReports(
@@ -20,42 +23,37 @@ def genReports(
 ):
     """
     goal
-    change simulation data into realistic reports of format [long,lat]
-    maybe date as well?
-
+    change simulation data into realistic reports of format [lat, lon, day]
 
     INPUTS
     --------
     sus = susceptible matrix of size MxN floats in range [0,1]
     infected = infected matrix of size MxN floats in range [0,1]
 
-    day = how many time steps have occurred
+    locs = 3d array from generate_latlon_matrix, shape (M, N, 2) -> [...,0]=lat, [...,1]=lon
+    dist_per_grid = size of one grid cell, in the SAME units as locs (degrees lat/lon).
+        Used to jitter a report's exact position to somewhere inside its grid cell instead of always the cell center.
 
-    locs = 3d array from generate_latlon_matrix
-    dist_per_grid = add random jitter to locations
-
-    seed = rng seed for reproducibility
-
-    fp = false positve rate for reports, should be randomized during the training after each indivdual simulation (TBD range)
-    fn = false negative, same as above
-
-    plantspergrid = how many plants are contained within each grid of the ndvi matrix
+    fp = false positive rate for reports (per healthy plant, per grid cell)
+    fn = false negative rate for reports (per truly-infected plant that got
+         detected by the Poisson draw below)
 
     RETURNS
     ---------
-    ?x3 matrix of reported disease detections with format LAT LON DAY
+    Nx3 ndarray of reported disease detections, columns = [lat, lon, day]
     """
     rng = np.random.default_rng(seed)
 
     # true positives
-
+    # expected number of infected plants "found" per cell
     counts = rng.poisson(Infected * plantspergrid)
     rows, cols = np.nonzero(counts)
     n = counts[rows, cols]
     rows_rep = np.repeat(rows, n)
     cols_rep = np.repeat(cols, n)
 
-    # removing false negatives
+    # false negatives
+    # fn chance of being missed by the surveyor/sensor
     if len(rows_rep) > 0:
         keep = rng.random(len(rows_rep)) >= fn
         rows_rep = rows_rep[keep]
@@ -68,14 +66,15 @@ def genReports(
     fp_rows_rep = np.repeat(fp_rows, fp_n)
     fp_cols_rep = np.repeat(fp_cols, fp_n)
 
-    # combining positives
+    # combine true + false positives
     all_rows = np.concatenate([rows_rep, fp_rows_rep])
     all_cols = np.concatenate([cols_rep, fp_cols_rep])
 
     if len(all_rows) == 0:
         return np.empty((0, 3), dtype=float)
 
-    # shuffling
+    # shuffle so true-positive and false-positive reports are interleaved
+    # rather than false positives always trailing at the end
     perm = rng.permutation(len(all_rows))
     all_rows = all_rows[perm]
     all_cols = all_cols[perm]
@@ -84,7 +83,8 @@ def genReports(
     lat = locs[all_rows, all_cols, 0].astype(float)
     lon = locs[all_rows, all_cols, 1].astype(float)
 
-    # adding jitter in each grid
+    # jitter each report to a random point inside its grid cell rather than
+    # always reporting the exact cell-center coordinate
     lat = lat + rng.uniform(-dist_per_grid / 2, dist_per_grid / 2, size=lat.shape)
     lon = lon + rng.uniform(-dist_per_grid / 2, dist_per_grid / 2, size=lon.shape)
 
@@ -100,7 +100,7 @@ def reports_to_sightings(reports):
     return [{"lat": r[0], "lon": r[1], "t": r[2]} for r in reports]
 
 
-def generate_latlon_matrix(input_matrix, center_idx, center_coords, dist_per_cell):
+def generate_latlon_matrix(input_matrix, center_coords, dist_per_cell=15):
     """
     creates a matrix of shape input_matrix with each value relating of the estimated long/lat
 
@@ -116,7 +116,7 @@ def generate_latlon_matrix(input_matrix, center_idx, center_coords, dist_per_cel
     numpy array with shape of input and one additional layer, representing each spaces relative coordinate
     """
     rows, cols = input_matrix.shape
-    center_row, center_col = center_idx
+    center_row, center_col = input_matrix.shape
     center_lat, center_lon = center_coords
 
     # constants
@@ -203,8 +203,12 @@ def load_random_ndvi(foldername, used=None):
     if not os.path.isdir(foldername):
         raise NotADirectoryError(f"Folder not found: {foldername}")
 
-    if used is None:
-        used = []
+    if used is None or (isinstance(used, np.ndarray) and used.size == 0):
+        used = np.empty((0, 2))
+    elif isinstance(used, list):
+        used = np.array(used)
+        if used.size == 0:
+            used = np.empty((0, 2))
 
     # get all png files in the folder
 
@@ -226,7 +230,9 @@ def load_random_ndvi(foldername, used=None):
 
     # load as 16-bit grayscale, convert to float
     img = Image.open(filepath)
-    ndvi = np.array(img).astype(float)
+    ndvi = (
+        np.array(img).astype(float) / 65536
+    )  # 16 bit data conversion back to range [0,1]
 
     # add new entry at the top of used
     new_entry = np.array([[lat, lon]])
@@ -248,5 +254,136 @@ def parse_latlon(fname):
     tuple with format (lat,lon) as floats
     """
     name = os.path.splitext(fname)[0]
-    lat_str, lon_str = name.split("-")
+    lat_str, lon_str = name.split("_")
     return float(lat_str), float(lon_str)
+
+
+def _rc_to_latlon_interp(row, col, georef):
+    """
+    helper function for create_polygon
+    helps for fractional row/col values
+
+    inputs
+
+    row = row position (float) to be calculated with the geo ref
+    col = same as above but for column
+    georef =
+
+    returns
+
+    lat
+    lon
+    """
+    lat = georef.lat_min + (row + 0.5) * georef.lat_step
+    lon = georef.lon_min + (col + 0.5) * georef.lon_step
+    return lat, lon
+
+
+def create_polygon(
+    prob_grid,
+    georef,
+    threshold=0.5,
+    method="contour",
+    simplify_tolerance_cells=0.5,
+):
+    """
+    prob_grid: (n_rows, n_cols) probabilities in [0, 1]
+    georef: the GridGeoref used to build the graph, for coordinate conversion
+    threshold: probability cutoff for "infected"
+    method: "contour" or "convex_hull"
+    simplify_tolerance_cells: shapely simplify tolerance, in grid-cell units
+        (only used for method="contour"; smooths jagged pixel edges)
+
+    Returns: list of (lat, lon) tuples describing the polygon boundary, or
+    None if nothing is above threshold.
+    """
+    if method == "convex_hull":
+        rows, cols = np.nonzero(prob_grid >= threshold)
+        if len(rows) == 0:
+            return None
+        points = [georef.rc_to_latlon(r, c) for r, c in zip(rows, cols)]
+        hull = MultiPoint([(lon, lat) for lat, lon in points]).convex_hull
+        if hull.geom_type != "Polygon":
+            return None
+        return [(lat, lon) for lon, lat in hull.exterior.coords]
+
+    elif method == "contour":
+        contours = measure.find_contours(prob_grid, level=threshold)
+        if not contours:
+            return None
+        # keep the largest contour by enclosed area (in cell units)
+        largest = max(
+            contours, key=lambda c: Polygon(c[:, ::-1]).area if len(c) >= 4 else 0
+        )
+        poly = Polygon(
+            largest[:, ::-1]
+        )  # find_contours gives (row, col); Polygon wants (x, y) = (col, row)
+        if not poly.is_valid or poly.is_empty:
+            return None
+        poly = poly.simplify(simplify_tolerance_cells, preserve_topology=True)
+        coords = list(poly.exterior.coords)
+        return [georef.rc_to_latlon(r, c) for c, r in coords]
+
+    else:
+        raise ValueError(f"unknown method: {method}")
+
+
+def plot_overlay(
+    grid, polygon, georef, title=None, cmap="viridis", ax=None, save_path=None
+):
+    """
+    visually displays the polygon around the infected area
+
+
+    inputs
+    ---------
+    grid = the area that will be contained (infected matrix)
+
+    polygon - output from create polygon
+
+    georef - needed to convert the polygon fractional locations to index values
+
+    title, cmap, ax = options to change the matplotlib resultant figure
+
+    save_path = to save the generated image
+
+    returns
+    --------
+    the matplot figure
+    """
+
+    # creating the base figure
+    created_fig = ax is None
+    if created_fig:
+        fig, ax = plt.subplots(figsize=(6, 6))
+    else:
+        fig = ax.figure
+
+    im = ax.imshow(grid, cmap=cmap, origin="upper")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    if polygon is not None and len(polygon) > 0:  # making sure the polygon is real
+        # conversion to int indicies
+        rows_poly, cols_poly = [], []
+        for lat, lon in polygon:  # slow but only used to visualize for people
+            row = georef.center_row - (lat - georef.center_lat) / georef.lat_scale
+            col = georef.center_col + (lon - georef.center_lon) / georef.lon_scale
+            rows_poly.append(row)
+            cols_poly.append(col)
+        # close the loop back to the first vertex
+        rows_poly.append(rows_poly[0])
+        cols_poly.append(cols_poly[0])
+        ax.plot(
+            cols_poly, rows_poly, color="red", linewidth=2, label="predicted polygon"
+        )
+        ax.legend(loc="upper right", fontsize=8)
+
+    ax.set_xlabel("col")
+    ax.set_ylabel("row")
+    if title:
+        ax.set_title(title)
+
+    if save_path:  # for saving the image
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+
+    return fig
