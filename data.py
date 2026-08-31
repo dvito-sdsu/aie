@@ -1,4 +1,3 @@
-# TODO imports
 import numpy as np
 import torch
 from pathlib import Path
@@ -8,6 +7,8 @@ import random
 from skimage import measure
 from shapely.geometry import Polygon, MultiPoint
 import matplotlib.pyplot as plt
+from scipy.spatial import cKDTree
+from model2 import GridGeoref
 
 
 def genReports(
@@ -19,7 +20,7 @@ def genReports(
     seed=None,
     fp=0.01,
     fn=0.01,
-    plantspergrid=10,
+    plantspergrid=1,
 ):
     """
     goal
@@ -91,6 +92,7 @@ def genReports(
     day_col = np.full(lat.shape, day, dtype=float)
 
     reports = np.column_stack([lat, lon, day_col])
+    # print(reports.shape)
     return reports
 
 
@@ -116,7 +118,7 @@ def generate_latlon_matrix(input_matrix, center_coords, dist_per_cell=15):
     numpy array with shape of input and one additional layer, representing each spaces relative coordinate
     """
     rows, cols = input_matrix.shape
-    center_row, center_col = input_matrix.shape
+    center_row, center_col = rows // 2, cols // 2
     center_lat, center_lon = center_coords
 
     # constants
@@ -267,16 +269,14 @@ def _rc_to_latlon_interp(row, col, georef):
 
     row = row position (float) to be calculated with the geo ref
     col = same as above but for column
-    georef =
+    georef = GridGeoref instance (see model.py)
 
     returns
 
     lat
     lon
     """
-    lat = georef.lat_min + (row + 0.5) * georef.lat_step
-    lon = georef.lon_min + (col + 0.5) * georef.lon_step
-    return lat, lon
+    return georef.rc_to_latlon(row, col)
 
 
 def create_polygon(
@@ -374,7 +374,11 @@ def plot_overlay(
         rows_poly.append(rows_poly[0])
         cols_poly.append(cols_poly[0])
         ax.plot(
-            cols_poly, rows_poly, color="red", linewidth=2, label="predicted polygon"
+            cols_poly,
+            rows_poly,
+            color="red",
+            linewidth=2,
+            label="true containing polygon",
         )
         ax.legend(loc="upper right", fontsize=8)
 
@@ -387,3 +391,263 @@ def plot_overlay(
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
 
     return fig
+
+
+def apply_model_and_plot(
+    model,
+    center_coords,
+    ndvi,
+    s_hist,
+    i_hist,
+    threshold,
+    dist_per_cell_meters=30,
+    device="cpu",
+    fp=0.01,
+    fn=0.01,
+    plantspergrid=10,
+    cmap="hot",
+    title=None,
+    save_path=None,
+    ax=None,
+):
+    """
+    function to apply the trained model to current simulation data
+    and visualize the predicted infected area
+
+    inputs
+    --------
+    model = trained OutbreakSTGNN model
+    center_coords = tuple (lat, lon) for the center of the grid
+    ndvi = (n_rows, n_cols) NDVI array used for model predictions
+    s_hist = (T, n_rows, n_cols) historical susceptible matrices
+    i_hist = (T, n_rows, n_cols) historical infected matrices
+    threshold = infection probability cutoff for predicted infected area
+    dist_per_cell_meters = real-world size of one pixel in meters
+    device = device to run model inference on ("cpu" or "cuda")
+    fp = false positive rate for sighting reports
+    fn = false negative rate for sighting reports
+    plantspergrid = number of plants per grid cell for report generation
+    cmap = colormap for the probability heatmap
+    title = custom title for the plot
+    save_path = location to save the figure
+    ax = existing matplotlib axis to plot on
+
+    returns
+    -------
+    fig = matplotlib figure object
+    predictions = (T, n_rows, n_cols) predicted infection probabilities
+    georef = GridGeoref object for coordinate conversions
+    polygon = predicted containment polygon as list of (lat, lon) tuples
+    """
+    model.eval()
+
+    n_rows, n_cols = ndvi.shape
+    timesteps = len(i_hist)
+
+    # create georef and location matrix
+    georef = GridGeoref(
+        center_coords=center_coords,
+        dist_per_cell=dist_per_cell_meters,
+        n_rows=n_rows,
+        n_cols=n_cols,
+    )
+    locs = generate_latlon_matrix(
+        ndvi, center_coords, dist_per_cell=dist_per_cell_meters
+    )
+
+    # generate sightings from historical simulation data
+    dist_per_grid_degrees = georef.lat_scale
+    sightings = []
+    timestamps = []
+
+    for day in range(timesteps):
+        reports = genReports(
+            s_hist[day],
+            i_hist[day],
+            day=day,
+            locs=locs,
+            dist_per_grid=dist_per_grid_degrees,
+            seed=None,
+            fp=fp,
+            fn=fn,
+            plantspergrid=plantspergrid,
+        )
+        sightings += reports_to_sightings(reports)
+        timestamps.append(float(day))
+
+    # build episode tensors for model input
+    x_seq, _ = build_episode_tensors(
+        ndvi, sightings, np.array(timestamps), georef, None
+    )
+    x_seq = x_seq.to(device)
+
+    # build graph connections
+    edge_index, edge_weight = build_connections(n_rows, n_cols)
+    edge_index = edge_index.to(device)
+    edge_weight = edge_weight.to(device)
+
+    # run model to get predictions
+    with torch.no_grad():
+        logits_list = model(x_seq, edge_index, edge_weight)
+
+    # convert logits to probabilities
+    predictions = torch.sigmoid(torch.stack(logits_list)).cpu().numpy()
+    predictions = predictions.reshape(timesteps, n_rows, n_cols)
+
+    # use the last timestep (current state) for plotting
+    current_probs = predictions[-1]
+
+    # create polygon around predicted infected area
+    polygon = create_polygon(
+        current_probs,
+        georef,
+        threshold=threshold,
+        method="contour",
+        simplify_tolerance_cells=0.5,
+    )
+
+    # create the plot
+    created_fig = ax is None
+    if created_fig:
+        fig, ax = plt.subplots(figsize=(8, 8))
+    else:
+        fig = ax.figure
+
+    # plot probability heatmap
+    im = ax.imshow(current_probs, cmap=cmap, vmin=0, vmax=1, origin="upper")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Infection probability")
+
+    # overlay polygon if it exists
+    if polygon is not None and len(polygon) > 0:
+        # convert lat/lon polygon to row/col indices
+        rows_poly, cols_poly = [], []
+        for lat, lon in polygon:
+            row = georef.center_row - (lat - georef.center_lat) / georef.lat_scale
+            col = georef.center_col + (lon - georef.center_lon) / georef.lon_scale
+            rows_poly.append(row)
+            cols_poly.append(col)
+
+        # close the loop back to the first vertex
+        rows_poly.append(rows_poly[0])
+        cols_poly.append(cols_poly[0])
+
+        ax.plot(
+            cols_poly,
+            rows_poly,
+            color="cyan",
+            linewidth=2,
+            linestyle="--",
+            label="Predicted infected area",
+        )
+        ax.legend(loc="upper right", fontsize=8)
+
+    # add labels and title
+    ax.set_xlabel("col")
+    ax.set_ylabel("row")
+    if title:
+        ax.set_title(title)
+    else:
+        ax.set_title(f"Predicted infection spread (threshold={threshold:.2f})")
+
+    # save if requested
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+
+    return fig, predictions, georef, polygon
+
+
+N_FEATURES = 4  # ndvi, all_sighting, time_since_sighting, dist_to_sighting
+
+
+def sightings_to_grid_timeline(sightings, georef, timestamps):
+    """
+    Optimized version using KD-tree for fast nearest-neighbor distance computation.
+    """
+    n_nodes = georef.n_rows * georef.n_cols
+    T = len(timestamps)
+    first_sighting_time = np.full(n_nodes, np.inf)
+
+    for s in sightings:
+        row, col = georef.latlon_to_rc(s["lat"], s["lon"])
+        node = georef.node_id(row, col)
+        first_sighting_time[node] = min(first_sighting_time[node], s["t"])
+
+    all_sighting = np.zeros((T, n_nodes), dtype=np.float32)
+    time_since = np.zeros((T, n_nodes), dtype=np.float32)
+    dist_to_sighting = np.full((T, n_nodes), 1e3, dtype=np.float32)
+
+    # Pre-compute all node coordinates once
+    rows = np.arange(georef.n_rows)
+    cols = np.arange(georef.n_cols)
+    grid_r, grid_c = np.meshgrid(rows, cols, indexing="ij")
+    all_node_coords = np.column_stack([grid_r.ravel(), grid_c.ravel()])
+
+    for t_idx, t in enumerate(timestamps):
+        active_mask = first_sighting_time <= t
+        all_sighting[t_idx] = active_mask.astype(np.float32)
+        time_since[t_idx] = np.where(
+            active_mask, np.maximum(t - first_sighting_time, 0.0), 0.0
+        )
+
+        if active_mask.any():
+            active_nodes = np.nonzero(active_mask)[0]
+            active_coords = all_node_coords[
+                active_nodes
+            ]  # Direct indexing, no conversion needed
+
+            # KD-tree for fast nearest neighbor search (Chebyshev distance)
+            tree = cKDTree(active_coords)
+            dist, _ = tree.query(all_node_coords, k=1, p=np.inf)  # p=np.inf = Chebyshev
+            dist_to_sighting[t_idx] = dist
+
+    return all_sighting, time_since, dist_to_sighting
+
+
+def build_episode_tensors(
+    ndvi_grid, sightings, timestamps, georef, ground_truth_masks=None
+):
+    """
+    Assembles one episode into the tensors OutbreakSTGNN.forward() expects.
+
+    ndvi_grid: (n_rows, n_cols) static NDVI, values in [0, 1]
+    sightings: cumulative sighting list, see sightings_to_grid_timeline()
+    timestamps: sorted array of T snapshot times
+    georef: the GridGeoref for this episode's grid
+    ground_truth_masks: optional (T, n_rows, n_cols) binary array of true
+        infection state per day, from your simulator. Required for
+        training; omit for inference.
+
+    Returns:
+        x_seq: (T, n_nodes, N_FEATURES) float32 tensor
+        y_seq: (T, n_nodes) float32 tensor, or None if ground_truth_masks
+               wasn't given
+    """
+    n_rows, n_cols = georef.n_rows, georef.n_cols
+    n_nodes = n_rows * n_cols
+    T = len(timestamps)
+
+    all_sighting, time_since, dist_to_sighting = sightings_to_grid_timeline(
+        sightings, georef, timestamps
+    )
+
+    ndvi_flat = ndvi_grid.reshape(-1).astype(np.float32)
+    time_since_norm = time_since / (time_since.max() + 1e-6)
+    dist_norm = np.clip(dist_to_sighting / max(n_rows, n_cols), 0, 1)
+
+    features = np.zeros((T, n_nodes, N_FEATURES), dtype=np.float32)
+    for t in range(T):
+        features[t, :, 0] = ndvi_flat
+        features[t, :, 1] = all_sighting[t]
+        features[t, :, 2] = time_since_norm[t]
+        features[t, :, 3] = dist_norm[t]
+
+    x_seq = torch.tensor(features, dtype=torch.float32)
+
+    y_seq = None
+    if ground_truth_masks is not None:
+        y_seq = torch.tensor(
+            ground_truth_masks.reshape(T, n_nodes).astype(np.float32),
+            dtype=torch.float32,
+        )
+
+    return x_seq, y_seq

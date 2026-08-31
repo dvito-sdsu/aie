@@ -7,23 +7,28 @@ import numpy as np
 
 class OutbreakSTGNN(nn.Module):
     def __init__(self, in_channels, hidden_channels=32, K=2, dropout=0.2):
-        """
-        in_channels: number of node features per timestep
-        hidden_channels: size of the recurrent hidden state per node
-        K: diffusion-convolution filter size (tsl calls this `k`)
-        """
         super().__init__()
         self.recurrent = DCRNN(
             input_size=in_channels,
             hidden_size=hidden_channels,
-            n_layers=1,
+            n_layers=3,
             k=K,
             return_only_last_state=False,
         )
         self.dropout = nn.Dropout(dropout)
+
+        # Add spatial processing layers
+        self.spatial_conv = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels * 2),
+            nn.ReLU(),
+            nn.Linear(hidden_channels * 2, hidden_channels),
+            nn.ReLU(),
+        )
+
         self.head = nn.Sequential(
             nn.Linear(hidden_channels, hidden_channels),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_channels, 1),
         )
 
@@ -48,11 +53,11 @@ class OutbreakSTGNN(nn.Module):
             h_seq = out
 
         # Expected shape: (1, T, n_nodes, hidden_channels)
-        h_seq = h_seq.squeeze(0)  # (T, n_nodes, hidden_channels)
-        out = self.dropout(F.relu(h_seq))
-        logits = self.head(out).squeeze(-1)  # (T, n_nodes)
+        h_seq = self.spatial_conv(h_seq) + h_seq  # Residual connection
 
-        # Keep original behaviour: return list of per‑timestep predictions
+        out = self.dropout(F.relu(h_seq))
+        logits = self.head(out).squeeze(-1)
+
         return [logits[t] for t in range(logits.shape[0])]
 
     def run_episode(self, snapshot_sequence, device="cpu"):
@@ -79,6 +84,16 @@ class OutbreakSTGNN(nn.Module):
 
         x_seq = torch.stack(xs, dim=0)  # (T, n_nodes, in_channels)
         return self(x_seq, edge_index, edge_weight)
+
+    def get_config(self):
+        """Return model configuration as dict"""
+        return {
+            "in_channels": self.in_channels,
+            "hidden_channels": self.hidden_channels,
+            "n_layers": self.n_layers,
+            "K": self.K,
+            "dropout": self.dropout_rate,
+        }
 
 
 class GridGeoref:
