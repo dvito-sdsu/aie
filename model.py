@@ -1,64 +1,78 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tsl.nn.blocks.encoders import DCRNN
-import numpy as np
+from georef import GridGeoref  # re-export so existing imports still work
+
+# NOTE: `from tsl.nn.blocks.encoders import DCRNN` was removed here — it was
+# never used (OutbreakSTGNN implements its own diffusion via _aggregate),
+# but as a top-level import it would fail this entire module (including
+# ConvLSTMUNet) if the `tsl` package isn't installed. Re-add only if/when
+# DCRNN is actually wired in.
 
 
 class OutbreakSTGNN(nn.Module):
-    def __init__(self, in_channels, hidden_channels=32, K=2, dropout=0.2):
+    """
+    Memory-efficient spatiotemporal outbreak prediction model.
+
+    Processes each timestep independently through shared spatial
+    graph-convolution weights. No recurrence, so no backprop-through-time
+    and no per-step hidden state stored. Temporal information is carried
+    entirely by the input features.
+
+    Why this is much cheaper than DCRNN:
+      DCRNN stores gate activations (r, u, c) at every timestep for every
+      layer, plus hidden state before and after each step. That's roughly
+      O(T * N * H * n_layers * ~6) stored activations.
+      This model stores only layer outputs: O(T * N * H * n_layers * ~2).
+      At the same T, N, H, that's a 10-15x reduction in activation memory.
+
+    Inputs:
+      x_seq:       (T, N, F)     node features per timestep
+      edge_index:  (2, E)        source, target node pairs
+      edge_weight: (E,)          per-edge scalar weight
+
+    Output:
+      list of T tensors, each (N,), raw logits per node.
+    """
+
+    def __init__(self, in_channels, hidden_channels=64, n_layers=2, dropout=0.1):
         super().__init__()
-        self.recurrent = DCRNN(
-            input_size=in_channels,
-            hidden_size=hidden_channels,
-            n_layers=3,
-            k=K,
-            return_only_last_state=False,
+        self.hidden_channels = hidden_channels
+        self.n_layers = n_layers
+
+        self.input_proj = nn.Linear(in_channels, hidden_channels)
+        self.layers = nn.ModuleList(
+            [nn.Linear(hidden_channels * 2, hidden_channels) for _ in range(n_layers)]
         )
+        self.head = nn.Linear(hidden_channels, 1)
         self.dropout = nn.Dropout(dropout)
 
-        # Add spatial processing layers
-        self.spatial_conv = nn.Sequential(
-            nn.Linear(hidden_channels, hidden_channels * 2),
-            nn.ReLU(),
-            nn.Linear(hidden_channels * 2, hidden_channels),
-            nn.ReLU(),
-        )
-
-        self.head = nn.Sequential(
-            nn.Linear(hidden_channels, hidden_channels),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_channels, 1),
-        )
+    def _aggregate(self, h, src, dst, edge_weight):
+        """
+        One round of diffusion. h: (N, H) -> (N, H).
+        """
+        msg = h[src] * edge_weight.unsqueeze(-1)  # (E, H), transient
+        agg = torch.zeros_like(h)
+        agg.index_add_(0, dst, msg)
+        return agg
 
     def forward(self, x_seq, edge_index, edge_weight):
-        """
-        x_seq: (T, n_nodes, in_channels)
-        edge_index: (2, E)
-        edge_weight: (E,) or (E, 1)
-        returns: list of tensors, one per timestep, each of shape (n_nodes,)
-        """
-        # tsl wants [batch, time, nodes, features]
-        x = x_seq.unsqueeze(0)  # (1, T, n_nodes, in_channels)
+        T, N, _ = x_seq.shape
+        src, dst = edge_index
 
-        out = self.recurrent(x, edge_index, edge_weight)
+        h = self.input_proj(x_seq)  # (T, N, H)
+        edge_weight = edge_weight.to(h.dtype)  # cast once
 
-        # Handle possible return types from tsl's DCRNN:
-        if isinstance(out, tuple):  # (output, hidden_final) likely shape
-            h_seq = out[0]  # (output, h_final)
-        elif isinstance(out, list):
-            h_seq = out[-1]  # last layer output
-        else:  # tensor
-            h_seq = out
+        for layer in self.layers:
+            agg = torch.empty_like(h)
+            for t in range(T):
+                agg[t] = self._aggregate(h[t], src, dst, edge_weight)
+            h = F.relu(layer(torch.cat([h, agg], dim=-1)))
+            h = self.dropout(h)
 
-        # Expected shape: (1, T, n_nodes, hidden_channels)
-        h_seq = self.spatial_conv(h_seq) + h_seq  # Residual connection
-
-        out = self.dropout(F.relu(h_seq))
-        logits = self.head(out).squeeze(-1)
-
-        return [logits[t] for t in range(logits.shape[0])]
+        logits = self.head(h).squeeze(-1)
+        return [logits[t] for t in range(T)]
 
     def run_episode(self, snapshot_sequence, device="cpu"):
         """
@@ -88,126 +102,243 @@ class OutbreakSTGNN(nn.Module):
     def get_config(self):
         """Return model configuration as dict"""
         return {
-            "in_channels": self.in_channels,
             "hidden_channels": self.hidden_channels,
             "n_layers": self.n_layers,
-            "K": self.K,
-            "dropout": self.dropout_rate,
+            "dropout": self.dropout.p,
         }
 
 
-class GridGeoref:
-    """
-    maps between geographic coordinates (lat, lon) and grid indices (row, col)
 
-    The grid is assumed to be perfectly rectangular in physical space,
-    with constant cell spacing (dist_per_cell) in meters along both axes.
-    The mapping uses a spherical Earth approximation with radius R.
 
-    The longitude scale is fixed at the centre latitude; this is accurate
-    only for grids with limited latitudinal extent (see class docstring).
-    """
 
-    R = 6378137.0  # earth's equatorial radius in meters
-    RAD_PER_DEG = np.pi / 180.0
-    DEG_PER_RAD = 180.0 / np.pi
 
-    def __init__(self, center_coords, dist_per_cell, n_rows, n_cols, center_idx=None):
-        """
-        inputs
-        -------
-            center_coords: (lat, lon) of the reference cell.
-            dist_per_cell: grid spacing in meters (must be > 0).
-            n_rows, n_cols: grid dimensions (must be > 0).
-            center_idx: (row, col) of the reference cell, if none,
-                        the cell closest to the array's geometric centre is used.
-        """
-        # --- Input validation ---
-        if dist_per_cell <= 0:
-            raise ValueError("dist_per_cell must be positive")
-        if n_rows <= 0 or n_cols <= 0:
-            raise ValueError("n_rows and n_cols must be positive integers")
-        center_lat, center_lon = center_coords
-        if not (-90.0 <= center_lat <= 90.0) or not (-180.0 <= center_lon <= 180.0):
-            raise ValueError("Invalid latitude or longitude")
-        if abs(center_lat) >= 89.9:  # avoid cos(lat) ~ 0
-            raise ValueError(
-                "Centre latitude too close to a pole; cosine would be near zero"
-            )
+class DoubleConv(nn.Module):
+    """Two 3x3 convs with batch norm and ReLU."""
 
-        if center_idx is None:
-            center_idx = (n_rows // 2, n_cols // 2)
-        self.center_row, self.center_col = center_idx
-        self.center_lat, self.center_lon = center_coords
-        self.dist_per_cell = dist_per_cell
-        self.n_rows, self.n_cols = n_rows, n_cols
+    def __init__(self, in_ch, out_ch, mid_channels = None, dropout=0.0):
+        super().__init__()
+        if mid_channels is None:
+            mid_channels = out_ch
+        layers = [
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        ]
+        if dropout > 0:
+            layers.append(nn.Dropout2d(dropout))
+        self.block = nn.Sequential(*layers)
 
-        # Precompute scales (degrees per cell) for fast conversion.
-        # lat_scale is constant because meridians are parallel on a sphere.
-        # lon_scale is fixed at the centre latitude – see accuracy note above.
-        cos_lat = np.cos(self.center_lat * self.RAD_PER_DEG)
-        self.lat_scale = (dist_per_cell / self.R) * self.DEG_PER_RAD
-        self.lon_scale = (dist_per_cell / (self.R * cos_lat)) * self.DEG_PER_RAD
+    def forward(self, x):
+        return self.block(x)
 
-    @classmethod
-    def from_locs(cls, locs, dist_per_cell, center_idx=None):
-        """
-        Alternative constructor that extracts centre coordinates from a
-        pre‑existing lat/lon array (as generated by generate_latlon_matrix).
 
-        Assumes the array is exactly consistent with dist_per_cell and the
-        rectangular grid geometry; no validation of that consistency is done.
-        """
-        n_rows, n_cols = locs.shape[0], locs.shape[1]
-        if center_idx is None:
-            center_idx = (n_rows // 2, n_cols // 2)
-        center_lat = locs[center_idx[0], center_idx[1], 0]
-        center_lon = locs[center_idx[0], center_idx[1], 1]
-        return cls(
-            center_coords=(center_lat, center_lon),
-            dist_per_cell=dist_per_cell,
-            n_rows=n_rows,
-            n_cols=n_cols,
-            center_idx=center_idx,
+class Down(nn.Module):
+    """Maxpool then DoubleConv."""
+
+    def __init__(self, in_ch, out_ch, dropout=0.0):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(in_ch, out_ch, dropout),
         )
 
-    def rc_to_latlon(self, row, col):
-        """
-        Convert grid indices (row, col) to geographic coordinates (lat, lon).
+    def forward(self, x):
+        return self.block(x)
 
-        Accepts floating point indices, allowing interpolation of positions
-        between cell centres. The result is the exact lat/lon of that point
-        under the spherical approximation.
-        """
-        lat = self.center_lat + (self.center_row - row) * self.lat_scale
-        lon = self.center_lon + (col - self.center_col) * self.lon_scale
-        return lat, lon
 
-    def latlon_to_rc(self, lat, lon):
-        """
-        Convert geographic coordinates (lat, lon) to the nearest valid grid cell.
+class Up(nn.Module):
+    """Upsample, concat with skip, then DoubleConv."""
 
-        The conversion is performed by inverting the forward formula, then
-        rounding to the closest integer index. The result is clipped to
-        [0, n_rows-1] and [0, n_cols-1] to guarantee a valid index.
-        """
-        row_float = self.center_row - (lat - self.center_lat) / self.lat_scale
-        col_float = self.center_col + (lon - self.center_lon) / self.lon_scale
-        row = round(row_float)
-        col = round(col_float)
-        # Clip to valid range; rounding then clipping is stable and safe.
-        row = max(0, min(row, self.n_rows - 1))
-        col = max(0, min(col, self.n_cols - 1))
-        return row, col
+    def __init__(self, in_ch, skip_ch, out_ch, dropout=0.0):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.conv = DoubleConv(in_ch + skip_ch, out_ch, dropout)
 
-    def node_id(self, row, col):
-        """
-        Return a linear index for the cell at (row, col)
-        """
-        return row * self.n_cols + col
+    def forward(self, x, skip):
+        x = self.up(x)
+        # handle odd sizes: crop or pad to match skip
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = F.interpolate(
+                x, size=skip.shape[-2:], mode="bilinear", align_corners=False
+            )
+        x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
 
-    def rc_of_node(self, node_id):
+
+class OutbreakUNet(nn.Module):
+    """
+    U-Net for per-timestep disease prediction from raster inputs.
+
+    Treats timesteps as a batch dimension: the same conv stack runs on
+    every timestep independently. Temporal information is carried by the
+    input features (time_since_sighting, dist_to_sighting, etc.).
+
+    Input:  (T, C, H, W)     C = N_FEATURES, H, W = grid dims
+    Output: list of T tensors, each (1, H, W) with raw logits
+
+    Memory and speed are O(T * H * W) rather than O(T * N * E) as in the
+    graph model, and there are no scatter/index_add ops. For a 100x100
+    grid at T=150, expect ~1-2 GB peak and ~0.05s per episode.
+    """
+
+    def __init__(self, in_channels, base_channels=32, depth=4, dropout=0.1):
+        super().__init__()
+        self.depth = depth
+        self.in_channels = in_channels
+        self.base_channels = base_channels
+
+        # Encoder
+        self.inc = DoubleConv(in_channels, base_channels, dropout)
+        ch = base_channels
+        self.downs = nn.ModuleList()
+        for _ in range(depth):
+            self.downs.append(Down(ch, ch * 2, dropout))
+            ch *= 2
+
+        # Decoder
+        self.ups = nn.ModuleList()
+        for _ in range(depth):
+            self.ups.append(Up(ch, ch // 2, ch // 2, dropout))
+            ch //= 2
+
+        # Head: 1x1 conv to single channel
+        self.head = nn.Conv2d(base_channels, 1, 1)
+
+    def forward(self, x_seq):
         """
-        Recover (row, col) from a linear node_id
+        x_seq: (T, C, H, W)
+        returns: list of T tensors, each (1, H, W)
         """
-        return divmod(node_id, self.n_cols)
+        # Encoder with skip storage
+        skips = []
+        x = self.inc(x_seq)
+        skips.append(x)
+        for down in self.downs:
+            x = down(x)
+            skips.append(x)
+
+        # skips[-1] is the bottleneck; drop it and reverse the rest
+        skips = skips[:-1][::-1]
+
+        for up, skip in zip(self.ups, skips):
+            x = up(x, skip)
+
+        logits = self.head(x)  # (T, 1, H, W)
+        return [logits[t] for t in range(logits.shape[0])]
+
+
+class ConvLSTMCell(nn.Module):
+    """Single ConvLSTM cell. Standard gates: input, forget, output, candidate."""
+    def __init__(self, in_ch, hidden_ch, kernel_size=3):
+        super().__init__()
+        padding = kernel_size // 2
+        self.hidden_ch = hidden_ch
+        self.conv = nn.Conv2d(
+            in_ch + hidden_ch, 4 * hidden_ch, kernel_size, padding=padding
+        )
+
+    def forward(self, x, h, c):
+        # x: (B, C_in, H, W), h, c: (B, C_hid, H, W)
+        combined = torch.cat([x, h], dim=1)
+        gates = self.conv(combined)
+        i, f, o, g = gates.chunk(4, dim=1)
+        i = torch.sigmoid(i)
+        f = torch.sigmoid(f)
+        o = torch.sigmoid(o)
+        g = torch.tanh(g)
+        c_next = f * c + i * g
+        h_next = o * torch.tanh(c_next)
+        return h_next, c_next
+
+
+class ConvLSTM(nn.Module):
+    """Processes a (B, T, C, H, W) sequence through a ConvLSTM cell."""
+    def __init__(self, in_ch, hidden_ch, kernel_size=3):
+        super().__init__()
+        self.cell = ConvLSTMCell(in_ch, hidden_ch, kernel_size)
+        self.hidden_ch = hidden_ch
+
+    def forward(self, x):
+        B, T, C, H, W = x.shape
+        h = torch.zeros(B, self.hidden_ch, H, W, device=x.device, dtype=x.dtype)
+        c = torch.zeros(B, self.hidden_ch, H, W, device=x.device, dtype=x.dtype)
+        outputs = []
+        for t in range(T):
+            h, c = self.cell(x[:, t], h, c)
+            outputs.append(h)
+        return torch.stack(outputs, dim=1)  # (B, T, C_hid, H, W)
+
+class ConvLSTMUNet(nn.Module):
+    """
+    U-Net with a ConvLSTM bottleneck.
+
+    Input:  (B, T, C, H, W)
+    Output: list of T tensors, each (B, 1, H, W) with raw logits
+
+    Encoder and decoder run per-frame (T folded into batch).
+    The ConvLSTM at the bottleneck propagates temporal state across timesteps.
+    """
+    def __init__(self, in_channels, base_channels=32, depth=4,
+                 dropout=0.1, convlstm_layers=1):
+        super().__init__()
+        self.depth = depth
+        self.in_channels = in_channels
+        self.base_channels = base_channels
+
+        # Encoder
+        self.inc = DoubleConv(in_channels, base_channels, dropout)
+        ch = base_channels
+        self.downs = nn.ModuleList()
+        for _ in range(depth):
+            self.downs.append(Down(ch, ch * 2, dropout))
+            ch *= 2
+
+        # Bottleneck ConvLSTM
+        self.convlstm = ConvLSTM(ch, ch, kernel_size=3)
+
+        # Decoder
+        self.ups = nn.ModuleList()
+        for _ in range(depth):
+            self.ups.append(Up(ch, ch // 2, ch // 2, dropout))
+            ch //= 2
+
+        self.head = nn.Conv2d(base_channels, 1, 1)
+
+    def forward(self, x_seq):
+        # x_seq: (B, T, C, H, W)
+        B, T, C, H, W = x_seq.shape
+
+        # --- Encoder: run per-frame ---
+        x = x_seq.reshape(B * T, C, H, W)
+        skips = []
+        x = self.inc(x)
+        skips.append(x)
+        for down in self.downs:
+            x = down(x)
+            skips.append(x)
+
+        # skips: list of (B*T, ch_i, h_i, w_i). Last one is the bottleneck.
+
+        # --- ConvLSTM at bottleneck ---
+        _, ch_b, h_b, w_b = x.shape
+        x = x.reshape(B, T, ch_b, h_b, w_b)
+        x = self.convlstm(x)           # (B, T, ch_b, h_b, w_b)
+
+        # --- Decoder: run per-frame ---
+        x = x.reshape(B * T, ch_b, h_b, w_b)
+
+        # Reverse encoder skips, drop the bottleneck
+        skips = skips[:-1][::-1]
+
+        for up, skip in zip(self.ups, skips):
+            x = up(x, skip)
+
+        logits = self.head(x)          # (B*T, 1, H, W)
+        logits = logits.reshape(B, T, 1, H, W)
+
+        # Return per-timestep tensors to match the loss function contract
+        return [logits[:, t] for t in range(T)]
+

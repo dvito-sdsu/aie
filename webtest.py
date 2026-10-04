@@ -7,13 +7,13 @@ import numpy as np
 import rasterio
 import streamlit as st
 import torch
+from georef import GridGeoref
 from matplotlib.patches import Patch
 from scipy.ndimage import gaussian_filter
 from scipy.signal import convolve2d
 from shapely.geometry import MultiPoint, Polygon
 from skimage import measure
 
-from model import GridGeoref
 from ndvi import get_landsat_ndvi_and_temp_matrix, get_landsat_ndvi_matrix
 from simulation import (
     create_polygon,
