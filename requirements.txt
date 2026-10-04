@@ -1,0 +1,19 @@
+numpy
+streamlit
+rasterio
+scipy
+matplotlib
+importnb
+time
+shapely.geometry
+skimage
+streamlit
+torch --index-url https://download.pytorch.org/whl/cpu
+torch
+numpy
+matplotlib
+scikit-image
+scipy
+rasterio
+shapely
+pandas
