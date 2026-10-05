@@ -9,6 +9,9 @@ scikit-image
 streamlit
 torch --index-url https://download.pytorch.org/whl/cpu
 torch
+planetary_computer
+rioxarray
+pystac_client
 numpy
 matplotlib
 scikit-image
