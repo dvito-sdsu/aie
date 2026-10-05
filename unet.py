@@ -33,7 +33,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 # ---------------------------------------------------------------------------
 # U-Net blocks
 # ---------------------------------------------------------------------------
@@ -92,19 +91,18 @@ class ReportUNet(nn.Module):
     """
     U-Net with 2 input channels (NDVI, sliding-window reports).
 
-    The D axis is folded into the batch dimension. Each timestep is processed
-    independently; the model has no memory across time.
-
     Input:  (D, 2, H, W)
-    Output: list of D tensors, each (1, H, W)
+    Output: list of D tensors, each (n_horizons, H, W)
 
-    H and W must be divisible by 2**depth. With depth=4, use 112x112 or 128x128.
+    n_horizons = 1 reduces to single-day prediction.
     """
-    def __init__(self, in_channels=2, base_channels=32, depth=4, dropout=0.1):
+    def __init__(self, in_channels=2, base_channels=32, depth=4, dropout=0.1,
+                 n_horizons=1):
         super().__init__()
         self.in_channels = in_channels
         self.base_channels = base_channels
         self.depth = depth
+        self.n_horizons = n_horizons
 
         self.inc = DoubleConv(in_channels, base_channels, dropout)
         ch = base_channels
@@ -118,7 +116,8 @@ class ReportUNet(nn.Module):
             self.ups.append(Up(ch, ch // 2, ch // 2, dropout))
             ch //= 2
 
-        self.head = nn.Conv2d(base_channels, 1, 1)
+        # head outputs n_horizons channels: channel c predicts t + c + 1
+        self.head = nn.Conv2d(base_channels, n_horizons, 1)
 
     def forward(self, x):
         # x: (D, 2, H, W)
@@ -129,12 +128,12 @@ class ReportUNet(nn.Module):
             h = down(h)
             skips.append(h)
 
-        skips = skips[:-1][::-1]  # drop bottleneck, reverse
+        skips = skips[:-1][::-1]
 
         for up, skip in zip(self.ups, skips):
             h = up(h, skip)
 
-        logits = self.head(h)  # (D, 1, H, W)
+        logits = self.head(h)  # (D, n_horizons, H, W)
         return [logits[d] for d in range(logits.shape[0])]
 
 
@@ -204,37 +203,33 @@ def tversky_loss_episode(logits_list, y_seq, alpha=0.8, beta=0.2, smooth=1.0):
 def novelty_tversky(logits_list, y_seq, window_seq,
                     alpha=0.8, beta=0.2, smooth=1.0,
                     known_discount=0.5, discount_fn=True):
-    """
-    Tversky loss with reduced reward for predictions on already-known cells.
+    k_expected = y_seq.shape[1]
+    k_logits = logits_list[0].shape[0]
 
-    A cell is "known" at timestep t if the input window at t had a nonzero
-    value there (post any preprocessing the model received). Known cells
-    contribute less to the TP and (optionally) FN terms, so the model is
-    rewarded primarily for discoveries at new locations.
+    if k_logits != k_expected:
+        raise ValueError(
+            f"logits have {k_logits} horizons but y_seq has {k_expected}. "
+            f"Check that episode_from_npz(horizon=k) and "
+            f"ReportUNet(n_horizons=k) match."
+        )
 
-    inputs
-    --------
-    logits_list    : list of (1, H, W) tensors, one per timestep
-    y_seq          : (D, 1, H, W) binary target
-    window_seq     : (D, 1, H, W) window channel the model saw as input,
-                     or a list of (1, H, W) tensors.
-    alpha, beta    : Tversky weights on FN and FP
-    smooth         : denominator smoothing
-    known_discount : 0 = plain Tversky; 0.5 = known cells count half;
-                     1 = known cells contribute nothing to TP/FN
-    discount_fn    : if True, also reduce FN weight on known cells
-
-    returns
-    -------
-    loss : scalar tensor
-    """
-    all_probs = torch.cat([torch.sigmoid(l).float().view(-1) for l in logits_list])
-    all_targets = torch.cat([y.float().view(-1) for y in y_seq])
+    all_probs = torch.cat([torch.sigmoid(l).float().flatten() for l in logits_list])
+    all_targets = y_seq.float().flatten()
 
     if isinstance(window_seq, (list, tuple)):
-        known = torch.cat([(w > 0).float().view(-1) for w in window_seq])
+        ws = []
+        for w in window_seq:
+            if w.dim() == 3 and w.shape[0] == 1:
+                w = w.squeeze(0)
+            ws.append((w > 0).float())
+        known_dhw = torch.stack(ws, dim=0)              # (D', H, W)
     else:
-        known = (window_seq > 0).float().view(-1)
+        w = window_seq
+        if w.dim() == 4 and w.shape[1] == 1:
+            w = w.squeeze(1)                             # (D', H, W)
+        known_dhw = (w > 0).float()
+
+    known = known_dhw.unsqueeze(1).expand(-1, k_expected, -1, -1).reshape(-1)
 
     tp_w = 1.0 - known_discount * known
     fn_w = tp_w if discount_fn else torch.ones_like(known)
@@ -314,37 +309,22 @@ def _window_from_reports(reports, size):
     return result.astype(np.uint16)
 
 
-def episode_from_npz(path, window_size=5, target_size=(112, 112),
-                     log1p_window=True, horizon=1, infected_threshold=0.1,
+def episode_from_npz(path, window_size=5, target_size=(80, 80),
+                     log1p_window=True, horizon=5, infected_threshold=0.1,
                      subtract_one=False):
     """
-    Load one .npz and build inputs / targets for forecasting.
+    Load one .npz and build inputs / targets for multi-horizon forecasting.
 
-    Window source priority:
-      1. If the file has 'reports' (always true for save_window output),
-         compute the window from reports using `window_size`.
-      2. Else if the file has a precomputed 'window', use it as-is.
-      3. Else error.
-
-    Input  for day t: (ndvi, window[t])
-    Target for day t: ground_truth[t + horizon]
+    Input  at day t: (ndvi, window[t])
+    Target at day t: (gt[t+1], gt[t+2], ..., gt[t+horizon])
     The last `horizon` input frames are dropped since they have no target.
 
-    inputs
-    --------
-    path          : path to the .npz
-    window_size   : int, sliding window length in days (>= 1)
-    target_size   : (H, W) output grid size, divisible by 2**depth
-    log1p_window  : log1p transform on the report channel
-    horizon       : days ahead to predict (0 = same day, 1 = tomorrow)
-    infected_threshold : used only if ground_truth isn't in the file
-    subtract_one  : subtract 1 from every nonzero window count before log1p.
-                    Zero entries are left alone.
+    horizon = 1 reproduces the single-horizon behavior.
 
     returns
     -------
     x_seq : (D - horizon, 2, H, W) float32 tensor
-    y_seq : (D - horizon, 1, H, W) float32 tensor
+    y_seq : (D - horizon, horizon, H, W) float32 tensor
     """
     d = np.load(path, allow_pickle=False)
 
@@ -357,10 +337,7 @@ def episode_from_npz(path, window_size=5, target_size=(112, 112),
     elif has_window:
         window = d["window"].astype(np.int32)
     else:
-        raise ValueError(
-            f"{path}: neither 'reports' nor 'window' present, cannot "
-            f"build the report channel"
-        )
+        raise ValueError(f"{path}: neither 'reports' nor 'window' present")
 
     if "ground_truth" in d.files:
         gt = d["ground_truth"].astype(np.float32)
@@ -381,14 +358,21 @@ def episode_from_npz(path, window_size=5, target_size=(112, 112),
         window[mask] -= 1
 
     D = window.shape[0]
-    if horizon >= D:
-        raise ValueError(f"horizon={horizon} but episode only has D={D} days")
+    k = int(horizon)
+    D_out = D - k
+    if D_out <= 0:
+        raise ValueError(f"horizon={k} but episode only has D={D} days")
 
-    window_in = window[: D - horizon]
-    gt_target = gt[horizon: D]
+    window_in = window[:D_out]                       # (D_out, H, W)
+
+    # stack targets: for input day i, target is gt[i+1 : i+1+k]
+    targets = np.stack(
+        [gt[i + 1 : i + 1 + k] for i in range(D_out)],
+        axis=0,
+    )                                                # (D_out, k, H, W)
 
     x_seq = build_inputs(ndvi, window_in, log1p_window=log1p_window)
-    y_seq = torch.from_numpy(gt_target[:, None, :, :].astype(np.float32))
+    y_seq = torch.from_numpy(targets.astype(np.float32))
 
     return x_seq, y_seq
 
@@ -400,59 +384,62 @@ def episode_from_npz(path, window_size=5, target_size=(112, 112),
 def train_unet(
     sim_data_dir,
     window_size=5,
-    target_size=(112, 112),
+    target_size=(80, 80),
     log1p_window=True,
-    horizon=1,
-    subtract_one=False,
+    horizon=5,
+    subtract_one=True,
     known_discount=0.5,
     discount_fn=True,
+    horizon_weights=None,
     model=None,
-    n_epochs=20,
+    n_epochs=25,
     lr=1e-3,
     base_channels=32,
     depth=4,
     dropout=0.1,
-    device="cpu",
+    device="cuda",
     tversky_alpha=0.8,
     tversky_beta=0.2,
     val_split=0.2,
     shuffle=True,
     seed=42,
     use_amp=True,
-    save_path="unet_report.pth",
+    verbose_metrics=True,
+    save_path="unet.pth",
+    on_epoch_end=None,
 ):
     """
-    Train a plain U-Net on NDVI + sliding-window reports to forecast
-    infection `horizon` days ahead.
+    Train a ReportUNet with a multi-horizon head on NDVI + sliding-window
+    reports.
+
+    Input  at day t:  (ndvi, window[t])
+    Target at day t:  gt[t+1 : t+horizon+1]   — k future frames
+    Output at day t:  k channels of logits
 
     inputs
     --------
-    sim_data_dir   : folder of .npz files from simModel.save_window
-    window_size    : sliding window length in days (>= 1)
-    target_size    : (H, W) grid size, divisible by 2**depth
-    log1p_window   : log1p transform on the report channel
-    horizon        : days ahead to predict (0 = same day, 1 = tomorrow)
-    subtract_one   : subtract 1 from nonzero window entries before log1p
-    known_discount : novelty weight; 0 = plain Tversky, 0.5 = recommended
-    discount_fn    : also reduce FN weight on known cells
-    model          : pre-existing ReportUNet or None
-    n_epochs       : training epochs
-    lr             : learning rate
-    base_channels  : U-Net base width
-    depth          : U-Net depth
-    dropout        : U-Net dropout
-    device         : "cpu" or "cuda"
-    tversky_alpha, tversky_beta : loss weights
-    val_split      : fraction held out for validation
-    shuffle        : reshuffle training set each epoch
-    seed           : RNG seed
-    use_amp        : fp16 autocast on CUDA
-    save_path      : where to write the final checkpoint
+    horizon         : k, number of future days to predict simultaneously
+    horizon_weights : optional sequence of k floats. If provided, each
+                      horizon's contribution to the loss is scaled.
+                      Try [0.5, 1.0, 1.5, 2.0, 2.5] for k=5 to emphasize
+                      the far horizons. Default None = equal weighting.
+    verbose_metrics : print per-horizon dice each epoch
+    on_epoch_end    : optional callable(epoch, history, model). Called after
+                      each epoch completes. Use for MLflow logging, CSV
+                      writing, progress bars, early stopping hooks, etc.
+                      The function has no MLflow dependency itself.
+    (other parameters same as before)
 
     returns
     -------
     model, history
+        history keys:
+          train_loss     : list of floats per epoch
+          val_loss       : list of floats per epoch
+          horizon_dice   : list of k-length lists, one per epoch
     """
+    from pathlib import Path
+
     files = sorted(Path(sim_data_dir).glob("*.npz"))
     if not files:
         raise FileNotFoundError(f"No .npz files in {sim_data_dir}")
@@ -465,40 +452,111 @@ def train_unet(
     val_files = files[:n_val]
     train_files = files[n_val:]
 
-    # startup diagnostic
-    with np.load(files[0], allow_pickle=False) as d:
-        keys = sorted(d.files)
-    print(f"Loaded {len(files)} episodes: {len(train_files)} train, {len(val_files)} val")
-    print(f"File keys: {keys}")
-    print(f"window_size: {window_size}   horizon: {horizon}   "
-          f"target_size: {target_size}   subtract_one: {subtract_one}")
-    print(f"Loss: novelty_tversky   known_discount={known_discount}   "
-          f"discount_fn={discount_fn}")
+    k = int(horizon)
+    if horizon_weights is not None:
+        hw = torch.tensor(list(horizon_weights), dtype=torch.float32)
+        assert len(hw) == k, f"horizon_weights must have length {k}"
+    else:
+        hw = None
 
+    print(f"Loaded {len(files)} episodes: {len(train_files)} train, "
+          f"{len(val_files)} val")
+    print(f"horizon={k}  window_size={window_size}  "
+          f"target_size={target_size}  subtract_one={subtract_one}")
+    print(f"loss: novelty_tversky  known_discount={known_discount}  "
+          f"discount_fn={discount_fn}")
+    if hw is not None:
+        print(f"horizon_weights: {hw.tolist()}")
+
+    # --- model ---
     if model is None:
         model = ReportUNet(
-            in_channels=2, base_channels=base_channels,
-            depth=depth, dropout=dropout,
+            in_channels=2,
+            base_channels=base_channels,
+            depth=depth,
+            dropout=dropout,
+            n_horizons=k,
         ).to(device)
     else:
         model = model.to(device)
+        if getattr(model, "n_horizons", 1) != k:
+            raise ValueError(
+                f"model.n_horizons={model.n_horizons} but horizon={k}"
+            )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     amp_enabled = use_amp and device.startswith("cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
+    # --- loss ---
     def _loss(logits_list, y_seq, x_seq):
         window_ch = x_seq[:, 1:2, :, :]
-        return novelty_tversky(
-            logits_list, y_seq, window_ch,
-            alpha=tversky_alpha, beta=tversky_beta,
-            known_discount=known_discount,
-            discount_fn=discount_fn,
-        )
+        if hw is None:
+            return novelty_tversky(
+                logits_list, y_seq, window_ch,
+                alpha=tversky_alpha, beta=tversky_beta,
+                known_discount=known_discount, discount_fn=discount_fn,
+            )
+        hw_dev = hw.to(y_seq.device)
+        total = 0.0
+        weight_sum = 0.0
+        for c in range(k):
+            logits_c = [logits[c] for logits in logits_list]
+            y_c = y_seq[:, c:c+1, :, :]
+            loss_c = novelty_tversky(
+                logits_c, y_c, window_ch,
+                alpha=tversky_alpha, beta=tversky_beta,
+                known_discount=known_discount, discount_fn=discount_fn,
+            )
+            total = total + hw_dev[c] * loss_c
+            weight_sum = weight_sum + hw_dev[c]
+        return total / weight_sum
 
-    history = {"train_loss": [], "val_loss": []}
+    def _per_horizon_dice(logits_list, y_seq, threshold=0.5):
+        preds = torch.stack(logits_list).sigmoid()
+        preds = (preds > threshold).float()
+        targets = y_seq.float()
+        dice = torch.zeros(k, device=y_seq.device)
+        for c in range(k):
+            p = preds[:, c]
+            t = targets[:, c]
+            inter = (p * t).sum()
+            denom = p.sum() + t.sum()
+            dice[c] = (2.0 * inter / denom) if denom > 0 else 1.0
+        return dice.cpu().numpy()
+
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "horizon_dice": [],
+        "config": {
+            "sim_data_dir": str(sim_data_dir),
+            "window_size": window_size,
+            "target_size": list(target_size),
+            "log1p_window": log1p_window,
+            "horizon": k,
+            "subtract_one": subtract_one,
+            "known_discount": known_discount,
+            "discount_fn": discount_fn,
+            "horizon_weights": None if hw is None else hw.tolist(),
+            "n_epochs": n_epochs,
+            "lr": lr,
+            "base_channels": base_channels,
+            "depth": depth,
+            "dropout": dropout,
+            "device": device,
+            "tversky_alpha": tversky_alpha,
+            "tversky_beta": tversky_beta,
+            "val_split": val_split,
+            "seed": seed,
+            "use_amp": use_amp,
+            "n_train_files": len(train_files),
+            "n_val_files": len(val_files),
+        },
+    }
 
     for epoch in range(n_epochs):
+        # ---------- training ----------
         model.train()
         epoch_files = train_files[:]
         if shuffle:
@@ -511,11 +569,11 @@ def train_unet(
             optimizer.zero_grad()
 
             x_seq, y_seq = episode_from_npz(
-                path,
+                str(path),
                 window_size=window_size,
                 target_size=target_size,
                 log1p_window=log1p_window,
-                horizon=horizon,
+                horizon=k,
                 subtract_one=subtract_one,
             )
             x_seq = x_seq.to(device)
@@ -538,7 +596,11 @@ def train_unet(
         train_loss = epoch_loss / max(n_done, 1)
         history["train_loss"].append(train_loss)
 
+        # ---------- validation ----------
         val_loss = float("nan")
+        dice_accum = np.zeros(k, dtype=np.float64)
+        dice_count = 0
+
         if val_files:
             model.eval()
             v = 0.0
@@ -546,48 +608,74 @@ def train_unet(
             with torch.no_grad():
                 for path in val_files:
                     x_seq, y_seq = episode_from_npz(
-                        path,
+                        str(path),
                         window_size=window_size,
                         target_size=target_size,
                         log1p_window=log1p_window,
-                        horizon=horizon,
+                        horizon=k,
                         subtract_one=subtract_one,
                     )
                     x_seq = x_seq.to(device)
                     y_seq = y_seq.to(device)
+
                     with torch.amp.autocast("cuda", dtype=torch.float16,
                                             enabled=amp_enabled):
                         logits_list = model(x_seq)
                         loss = _loss(logits_list, y_seq, x_seq)
+
                     v += loss.item()
                     vn += 1
+                    dice_accum += _per_horizon_dice(logits_list, y_seq)
+                    dice_count += 1
+
             val_loss = v / max(vn, 1)
+            mean_dice = dice_accum / max(dice_count, 1)
             history["val_loss"].append(val_loss)
-            print(f"epoch {epoch+1}/{n_epochs}  train={train_loss:.4f}  val={val_loss:.4f}")
+            history["horizon_dice"].append(mean_dice.tolist())
+
+            if verbose_metrics:
+                dice_str = "  ".join(
+                    f"+{c+1}={mean_dice[c]:.3f}" for c in range(k)
+                )
+                print(f"epoch {epoch+1}/{n_epochs}  "
+                      f"train={train_loss:.4f}  val={val_loss:.4f}")
+                print(f"    dice: {dice_str}")
+            else:
+                print(f"epoch {epoch+1}/{n_epochs}  "
+                      f"train={train_loss:.4f}  val={val_loss:.4f}")
         else:
             history["val_loss"].append(float("nan"))
             print(f"epoch {epoch+1}/{n_epochs}  train={train_loss:.4f}")
 
-    torch.save({
+        # ---------- callback ----------
+        if on_epoch_end is not None:
+            on_epoch_end(epoch, history, model)
+
+    # ---------- save ----------
+    ckpt = {
         "model_state_dict": model.state_dict(),
         "model_config": {
             "in_channels": 2,
             "base_channels": base_channels,
             "depth": depth,
             "dropout": dropout,
+            "n_horizons": k,
         },
         "training_info": {
             "window_size": window_size,
             "target_size": list(target_size),
             "log1p_window": log1p_window,
-            "horizon": horizon,
+            "horizon": k,
             "subtract_one": subtract_one,
             "known_discount": known_discount,
             "discount_fn": discount_fn,
+            "horizon_weights": None if hw is None else hw.tolist(),
             "tversky_alpha": tversky_alpha,
             "tversky_beta": tversky_beta,
         },
-    }, save_path)
+        "history": history,
+    }
+    torch.save(ckpt, save_path)
     print(f"Model saved to {save_path}")
 
     return model, history
@@ -602,6 +690,7 @@ def load_unet(filepath, device="cpu"):
         base_channels=cfg.get("base_channels", 32),
         depth=cfg.get("depth", 4),
         dropout=cfg.get("dropout", 0.1),
+        n_horizons=cfg.get("n_horizons", 1), 
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
